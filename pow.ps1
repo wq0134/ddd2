@@ -2,9 +2,9 @@
 
 [CmdletBinding()]
 param(
-    [string]$AccountPath = "$env:APPDATA\.feather\account2.txt",  # Changed to account2.txt
+    [string]$AccountPath = "$env:APPDATA\.feather\account2.txt",
     [string]$LocalStatePath = "$env:APPDATA\Feather Launcher\Local State",
-    [string]$OutputPath = "$env:APPDATA\.feather\account2_decrypted.txt"  # Changed output filename
+    [string]$OutputPath = "$env:APPDATA\.feather\account2_decrypted.txt"
 )
 
 Add-Type -AssemblyName System.Security
@@ -24,8 +24,13 @@ function Get-DecryptionKey {
     }
 
     $encryptedKey = [Convert]::FromBase64String($encryptedKeyB64)
-    $dpapiBlobStart = 5
-    $dpapiBlob = $encryptedKey[$dpapiBlobStart..($encryptedKey.Length - 1)]
+    
+    # Check if it's DPAPI encrypted (starts with DPAPI)
+    if ($encryptedKey.Length -ge 5 -and [Text.Encoding]::ASCII.GetString($encryptedKey[0..4]) -eq 'DPAPI') {
+        $dpapiBlob = $encryptedKey[5..($encryptedKey.Length - 1)]
+    } else {
+        $dpapiBlob = $encryptedKey
+    }
 
     $aesKey = [Security.Cryptography.ProtectedData]::Unprotect(
         $dpapiBlob,
@@ -42,31 +47,56 @@ function Decrypt-AesGcm {
         [byte[]]$Key
     )
 
-    $versionPrefix = [Text.Encoding]::ASCII.GetString($EncryptedData[0..2])
+    try {
+        # Check if data starts with v10 or v11 (common for Chrome/Electron based apps)
+        if ($EncryptedData.Length -lt 3) {
+            throw "Encrypted data too short"
+        }
+        
+        $versionPrefix = [Text.Encoding]::ASCII.GetString($EncryptedData[0..2])
+        
+        if ($versionPrefix -match '^v1[01]$') {
+            # Standard v10/v11 format
+            $nonce = $EncryptedData[3..14]
+            $ciphertextWithTag = $EncryptedData[15..($EncryptedData.Length - 1)]
+            
+            $tagLength = 16
+            if ($ciphertextWithTag.Length -lt $tagLength) {
+                throw "Ciphertext too short for GCM tag"
+            }
+            
+            $ciphertext = $ciphertextWithTag[0..($ciphertextWithTag.Length - $tagLength - 1)]
+            $tag = $ciphertextWithTag[($ciphertextWithTag.Length - $tagLength)..($ciphertextWithTag.Length - 1)]
+        } else {
+            # Try different format - might be raw AES-GCM without version prefix
+            # Assuming first 12 bytes are nonce, last 16 bytes are tag
+            if ($EncryptedData.Length -lt 28) {  # Need at least 12 nonce + 1 data + 16 tag
+                throw "Data too short for AES-GCM"
+            }
+            
+            $nonce = $EncryptedData[0..11]
+            $tag = $EncryptedData[($EncryptedData.Length - 16)..($EncryptedData.Length - 1)]
+            $ciphertext = $EncryptedData[12..($EncryptedData.Length - 17)]
+        }
 
-    if ($versionPrefix -notmatch '^v1[01]$') {
-        throw "Unknown encryption version: $versionPrefix"
+        # Try using System.Security.Cryptography.AesGcm if available (.NET Core 3.0+)
+        $aesGcmType = [Type]::GetType('System.Security.Cryptography.AesGcm, System.Security.Cryptography.Algorithms')
+        
+        if ($aesGcmType -and $PSVersionTable.PSVersion -ge [Version]"7.0") {
+            Write-Host "Using .NET Core AES-GCM implementation..." -ForegroundColor Cyan
+            $plaintext = [byte[]]::new($ciphertext.Length)
+            $aesGcm = [Activator]::CreateInstance($aesGcmType, @(,$Key))
+            $aesGcm.Decrypt($nonce, $ciphertext, $tag, $plaintext)
+            return $plaintext
+        }
+        else {
+            # Fall back to BCrypt
+            Write-Host "Using BCrypt for AES-GCM..." -ForegroundColor Cyan
+            return Decrypt-AesGcmBCrypt -Key $Key -Nonce $nonce -Ciphertext $ciphertext -Tag $tag
+        }
     }
-
-    $nonce = $EncryptedData[3..14]
-    $ciphertextWithTag = $EncryptedData[15..($EncryptedData.Length - 1)]
-
-    $tagLength = 16
-    $ciphertext = $ciphertextWithTag[0..($ciphertextWithTag.Length - $tagLength - 1)]
-    $tag = $ciphertextWithTag[($ciphertextWithTag.Length - $tagLength)..($ciphertextWithTag.Length - 1)]
-
-    $aesGcmType = [Type]::GetType('System.Security.Cryptography.AesGcm, System.Security.Cryptography.Algorithms')
-
-    if ($aesGcmType) {
-        $plaintext = [byte[]]::new($ciphertext.Length)
-        $aesGcm = [Activator]::CreateInstance($aesGcmType, @(,$Key))
-        $aesGcmType.GetMethod('Decrypt', @([byte[]], [byte[]], [byte[]], [byte[]], [byte[]])).Invoke(
-            $aesGcm, @($nonce, $ciphertext, $tag, $plaintext, $null))
-        $aesGcm.Dispose()
-        return $plaintext
-    }
-    else {
-        return Decrypt-AesGcmBCrypt -Key $Key -Nonce $nonce -Ciphertext $ciphertext -Tag $tag
+    catch {
+        throw "AES-GCM decryption failed: $_"
     }
 }
 
@@ -144,14 +174,22 @@ public class BCryptAesGcm {
         public int dwFlags;
     }
 
-    public const uint STATUS_SUCCESS = 0;
+    public const uint BCRYPT_SUCCESS = 0x00000000;
+    public const uint STATUS_AUTH_TAG_MISMATCH = 0xC000A002;
     public const string BCRYPT_AES_ALGORITHM = "AES";
     public const string BCRYPT_CHAINING_MODE = "ChainingMode";
     public const string BCRYPT_CHAIN_MODE_GCM = "ChainingModeGCM";
+    public const uint BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG = 0x00000001;
+    public const uint BCRYPT_AUTH_MODE_IN_PROGRESS_FLAG = 0x00000002;
 }
 '@
 
-    Add-Type -TypeDefinition $bcryptSignature -ErrorAction SilentlyContinue
+    try {
+        Add-Type -TypeDefinition $bcryptSignature -ErrorAction Stop
+    }
+    catch {
+        throw "Failed to load BCrypt functions: $_"
+    }
 
     $hAlgorithm = [IntPtr]::Zero
     $hKey = [IntPtr]::Zero
@@ -163,7 +201,9 @@ public class BCryptAesGcm {
             $null,
             0)
 
-        if ($status -ne 0) { throw "BCryptOpenAlgorithmProvider failed: 0x$($status.ToString('X8'))" }
+        if ($status -ne 0) { 
+            throw "BCryptOpenAlgorithmProvider failed: 0x$($status.ToString('X8'))" 
+        }
 
         $gcmMode = [Text.Encoding]::Unicode.GetBytes([BCryptAesGcm]::BCRYPT_CHAIN_MODE_GCM + "`0")
         $status = [BCryptAesGcm]::BCryptSetProperty(
@@ -173,7 +213,9 @@ public class BCryptAesGcm {
             $gcmMode.Length,
             0)
 
-        if ($status -ne 0) { throw "BCryptSetProperty failed: 0x$($status.ToString('X8'))" }
+        if ($status -ne 0) { 
+            throw "BCryptSetProperty failed: 0x$($status.ToString('X8'))" 
+        }
 
         $status = [BCryptAesGcm]::BCryptGenerateSymmetricKey(
             $hAlgorithm,
@@ -184,11 +226,14 @@ public class BCryptAesGcm {
             $Key.Length,
             0)
 
-        if ($status -ne 0) { throw "BCryptGenerateSymmetricKey failed: 0x$($status.ToString('X8'))" }
+        if ($status -ne 0) { 
+            throw "BCryptGenerateSymmetricKey failed: 0x$($status.ToString('X8'))" 
+        }
 
         $authInfo = New-Object BCryptAesGcm+BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO
-        $authInfo.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($authInfo)
+        $authInfo.cbSize = [Runtime.InteropServices.Marshal]::SizeOf([BCryptAesGcm+BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO])
         $authInfo.dwInfoVersion = 1
+        $authInfo.dwFlags = [BCryptAesGcm]::BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG
 
         $nonceHandle = [Runtime.InteropServices.GCHandle]::Alloc($Nonce, [Runtime.InteropServices.GCHandleType]::Pinned)
         $tagHandle = [Runtime.InteropServices.GCHandle]::Alloc($Tag, [Runtime.InteropServices.GCHandleType]::Pinned)
@@ -210,7 +255,7 @@ public class BCryptAesGcm {
             $Ciphertext,
             $Ciphertext.Length,
             $authInfoPtr,
-            $null,
+            $null,  # IV is part of authInfo
             0,
             $plaintext,
             $plaintext.Length,
@@ -221,7 +266,12 @@ public class BCryptAesGcm {
         $tagHandle.Free()
         [Runtime.InteropServices.Marshal]::FreeHGlobal($authInfoPtr)
 
-        if ($status -ne 0) { throw "BCryptDecrypt failed: 0x$($status.ToString('X8'))" }
+        if ($status -eq [BCryptAesGcm]::STATUS_AUTH_TAG_MISMATCH) {
+            throw "Authentication tag mismatch - data may be corrupted or key is incorrect"
+        }
+        elseif ($status -ne 0) { 
+            throw "BCryptDecrypt failed with error: 0x$($status.ToString('X8'))" 
+        }
 
         return $plaintext[0..($resultSize - 1)]
     }
@@ -235,6 +285,34 @@ public class BCryptAesGcm {
     }
 }
 
+# Alternative: Try AES-CBC decryption (some launchers use this)
+function Decrypt-AesCbc {
+    param(
+        [byte[]]$EncryptedData,
+        [byte[]]$Key
+    )
+    
+    try {
+        # Try to find initialization vector - might be at start of data
+        $iv = $EncryptedData[0..15]
+        $ciphertext = $EncryptedData[16..($EncryptedData.Length - 1)]
+        
+        $aes = [Security.Cryptography.Aes]::Create()
+        $aes.Key = $Key
+        $aes.IV = $iv
+        $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+        
+        $decryptor = $aes.CreateDecryptor()
+        $plaintext = $decryptor.TransformFinalBlock($ciphertext, 0, $ciphertext.Length)
+        
+        return $plaintext
+    }
+    catch {
+        throw "AES-CBC decryption failed: $_"
+    }
+}
+
 try {
     Write-Host "Extracting AES key from Local State..." -ForegroundColor Cyan
     $aesKey = Get-DecryptionKey -LocalStatePath $LocalStatePath
@@ -244,12 +322,49 @@ try {
         throw "Account file not found: $AccountPath"
     }
 
-    Write-Host "Reading encrypted account data from account2.txt..." -ForegroundColor Cyan  # Updated message
+    Write-Host "Reading encrypted account data from account2.txt..." -ForegroundColor Cyan
     $encryptedData = [IO.File]::ReadAllBytes($AccountPath)
     Write-Host "Read $($encryptedData.Length) bytes" -ForegroundColor Green
+    
+    Write-Host "Data hex preview:" -ForegroundColor DarkGray
+    $hexPreview = ($encryptedData[0..31] | ForEach-Object { $_.ToString("X2") }) -join ' '
+    Write-Host "$hexPreview..." -ForegroundColor DarkGray
 
-    Write-Host "Decrypting with AES-GCM..." -ForegroundColor Cyan
-    $plaintext = Decrypt-AesGcm -EncryptedData $encryptedData -Key $aesKey
+    Write-Host "`nAttempting decryption..." -ForegroundColor Yellow
+    
+    # Try multiple decryption methods
+    $decryptionMethods = @("AES-GCM", "AES-CBC")
+    $success = $false
+    
+    foreach ($method in $decryptionMethods) {
+        try {
+            Write-Host "Trying $method decryption..." -ForegroundColor Cyan
+            
+            if ($method -eq "AES-GCM") {
+                $plaintext = Decrypt-AesGcm -EncryptedData $encryptedData -Key $aesKey
+            } elseif ($method -eq "AES-CBC") {
+                $plaintext = Decrypt-AesCbc -EncryptedData $encryptedData -Key $aesKey
+            }
+            
+            $decryptedText = [Text.Encoding]::UTF8.GetString($plaintext)
+            
+            # Check if decrypted text looks valid (JSON or readable text)
+            if ($decryptedText -match '^[\s\S]{10,}' -and ($decryptedText -match '{' -or $decryptedText -match '"' -or $decryptedText -match 'username' -or $decryptedText -match 'email')) {
+                Write-Host "Success! Used $method decryption" -ForegroundColor Green
+                $success = $true
+                break
+            } else {
+                Write-Host "$method produced invalid output, trying next method..." -ForegroundColor Yellow
+            }
+        }
+        catch {
+            Write-Host "$method failed: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    
+    if (-not $success) {
+        throw "All decryption methods failed. The file may be in a different format or corrupted."
+    }
 
     $outputDir = Split-Path $OutputPath -Parent
     if (-not (Test-Path $outputDir)) {
@@ -259,11 +374,18 @@ try {
     [IO.File]::WriteAllBytes($OutputPath, $plaintext)
     Write-Host "Decrypted data written to: $OutputPath" -ForegroundColor Green
 
-    $decryptedText = [Text.Encoding]::UTF8.GetString($plaintext)
     Write-Host "`nDecrypted content:" -ForegroundColor Yellow
-    Write-Host $decryptedText
+    Write-Host $decryptedText.Substring(0, [Math]::Min($decryptedText.Length, 500)) -ForegroundColor White
+    if ($decryptedText.Length -gt 500) {
+        Write-Host "... (truncated)" -ForegroundColor DarkGray
+    }
 }
 catch {
     Write-Error "Decryption failed: $_"
+    Write-Host "`nTroubleshooting tips:" -ForegroundColor Yellow
+    Write-Host "1. Make sure account2.txt is from the Feather launcher" -ForegroundColor Gray
+    Write-Host "2. Check if the Local State file is from the same Feather installation" -ForegroundColor Gray
+    Write-Host "3. The file might be in a different encryption format" -ForegroundColor Gray
+    Write-Host "4. Try with the original account.txt file instead" -ForegroundColor Gray
     exit 1
 }
